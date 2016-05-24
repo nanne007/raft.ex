@@ -10,7 +10,7 @@ defmodule Raft.FS.Log do
   end
 
 
-	def load_raft_meta(dir) do
+  def load_raft_meta(dir) do
     case read_meta_file(Path.join(dir, "meta2.info")) do
       %Meta{version: version1} = m1 ->
         case read_meta_file(Path.join(dir, "meta1.info")) do
@@ -30,7 +30,7 @@ defmodule Raft.FS.Log do
   end
 
   defp read_meta_file(filename) do
-	  case File.read(filename) do
+    case File.read(filename) do
       {:ok, data} ->
         case :erlang.binary_to_term(data) do
           %Meta{} = m ->
