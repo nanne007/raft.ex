@@ -1,8 +1,20 @@
 defmodule Raft.Consensus do
-  @election_timeout_key :election_timeout
-  @election_timeout_default_value 500
+  use Supervisor
+  def start_link(me) do
+    Supervisor.start_link(__MODULE__, me)
+  end
 
-  def get_election_timeout() do
-    Application.get_env(:raft_ex, @election_timeout_key, @election_timeout_default_value)
+  def init(me) do
+
+    children = [
+      worker(Raft.Server, [me])
+    ]
+    options =[
+      strategy: :one_for_one,
+      max_restarts: 2,
+      max_seconds: 5
+    ]
+
+    supervise(children, options)
   end
 end
