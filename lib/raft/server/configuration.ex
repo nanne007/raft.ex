@@ -6,7 +6,7 @@ defmodule Raft.Server.Configuration do
     id: nil,
     term: 0,
     index: 0,
-    members: %{}
+    members: []
   ]
   @type t :: %__MODULE__{
     id: term,
