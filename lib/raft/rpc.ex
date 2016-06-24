@@ -48,7 +48,7 @@ defmodule Raft.RPC do
       :prev_log_index,
       :prev_log_term,
       :entries,
-      :leader_commit_index
+      :leader_commit
     ]
 
     @type t :: %__MODULE__{
@@ -78,7 +78,7 @@ defmodule Raft.RPC do
 
   def send_msg(peer, %RequestVoteReply{} = message) do
     {name, node} = peer
-    args - [message]
+    args = [message]
     :rpc.cast(node, Raft.RPC, :handle_msg, args)
   end
 

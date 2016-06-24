@@ -7,26 +7,28 @@ defmodule Raft.Consensus do
   """
   @type t :: %__MODULE__{
     me: Raft.Server.id,
-    current_term: Raft.Server.rterm,
 
+    ## server vars
+    current_term: Raft.Server.rterm,
     voted_for: Raft.Server.id,
+
+    # log vars
+    log: pid,
+    commit_index: Raft.Server.index,
+    last_applied: Raft.Server.index,
+
+    ## candidate vars
     votes_responded: Map.t,
     votes_granted: Map.t,
     voter_log: Mapt.t,
 
-    log: pid,
-
-    commit_index: Raft.Server.index,
-    last_applied: Raft.Server.index,
-
-    next_indexes: list(Raft.Server.index),
-    match_indexes: list(Raft.Server.index),
+    ## leader vars
+    next_indexes: Map.t,
+    match_indexes: Map.t,
 
     timer: reference,
     meta: pid,
-    config: pid,
-
-    election: integer
+    config: pid
   }
 
   defstruct [
@@ -36,26 +38,19 @@ defmodule Raft.Consensus do
     voted_for: nil,
     votes_responded: %{},
     votes_granted: %{},
-    voter_log: %{}
+    voter_log: %{},
     log: nil,
 
     commit_index: 0,
     last_applied: 0,
 
-    next_indexes: [],
-    match_indexes: [],
+    next_indexes: %{},
+    match_indexes: %{},
 
     timer: nil,
     meta: nil,
-    config: nil,
-    election: 0
+    config: nil
   ]
-
-  defmodule CandidateState do
-    defstruct [
-      votes: %{}
-    ]
-  end
 
   @behaviour :gen_fsm
 
@@ -67,18 +62,24 @@ defmodule Raft.Consensus do
     pid |> :gem_fsm.sync_send_event({:request_vote, params})
   end
 
+  def get_state(pid) do
+    pid |> :gem_fsm.sync_send_event(:get_state)
+  end
+
+  #### gen_fsm callbacks
+
   def init({me}) do
     { :ok, :follower, bootstrap(me) }
   end
 
-
-
-  #### gen_fsm callbacks
+  def handle_sync_event(:get_state, _from, state_name, state) do
+    {:reply, state_name, state_name, state}
+  end
 
   def handle_sync_event(%RequestVote{} = vote_req, _from, state_name, state) do
     # Any RPC with a newer term causes the recipient to advance its term,
     # and transite to follower.
-    if current_term < vote_req.term do
+    if state.current_term < vote_req.term do
       state = state |> update_term(vote_req.term)
       state_name = :follower
     end
@@ -94,7 +95,12 @@ defmodule Raft.Consensus do
     {:next_state, :candidate, state |> reset_timer(0) }
   end
 
-  def candidate(:timeout, %__MODULE__{} = state) do
+  def candidate(:timeout, %__MODULE__{
+        current_term: current_term,
+        me: me,
+        config: config,
+        log: log
+                } = state) do
     state = %{ state |
                current_term: current_term + 1,
                voted_for: nil,
@@ -105,11 +111,14 @@ defmodule Raft.Consensus do
 
     peers = config |> Raft.Server.Configuration.get_peers()
 
+    last_log_term = log |> Raft.Log.last_log_term()
+    last_applied = log |> Raft.Log.last_log_index()
     # send request_vote to all peers
-    for perr <- peers do
+    for peer <- peers do
       request_vote_req = %RequestVote{
+        source: me,
+        dest: peer,
         term: current_term,
-        candidate_id: me,
         last_log_index: last_applied,
         last_log_term: last_log_term # TODO: get the last_log_term
       }
@@ -118,24 +127,80 @@ defmodule Raft.Consensus do
     {:next_state, :candidate, state |> reset_timer(election_timeout())}
   end
 
-  # TODO: implement vote reply handling.
-  # def candidate(
-  #   %RequestVoteReply{} = vote_reply,
-  #   %__MODULE__{
-  #     current_term: current_term
-  #   } = state) do
-  #   if vote_reply.term > current_term do
-  #     state = state |> update_term(vote_reply.term)
-  #     next_state_name = :follower
-  #   end
-  #   Logger.debug("receive rpc message #{vote_reply}")
-  #   if vote_reply.term < current_term do
-  #     # drop stale response
-  #     {:next_state, :candidate, state}
-  #   else
+  @doc """
+  Candidate handles `RequestVoteReply` from voters.
+  """
+  def candidate(
+    %RequestVoteReply{term: term} = vote_reply,
+    %__MODULE__{
+      current_term: current_term
+    } = state) when current_term < term do
+    Logger.debug("receive rpc message #{vote_reply}")
+    state = state|> update_term(term)
+    # Do nothing here
+    {:next_state, :follower, state}
+  end
+  def candidate(
+    %RequestVoteReply{term: term} = vote_reply,
+    %__MODULE__{
+      current_term: current_term
+    } = state) when current_term > term do # drop stale response
+    Logger.debug("receive stale rpc message #{vote_reply}")
+    {:next_state, :candidate, state}
+  end
+  def candidate(
+    %RequestVoteReply{
+      term: term,
+      vote_granted: granted,
+      source: source,
+      dest: dest
+    } = vote_reply,
+    %__MODULE__{
+      current_term: current_term,
+      votes_responded: votes_responded,
+      votes_granted: votes_granted
+    } = state) when current_term == term and not granted do
+    Logger.debug("receive rpc message #{vote_reply}")
+    state = %{state | votes_responded: votes_responded.put(source) }
+    {:next_state, :candidate, state}
+  end
+  def candidate(
+    %RequestVoteReply{
+      term: term,
+      vote_granted: granted,
+      source: source,
+      dest: dest
+    } = vote_reply,
+    %__MODULE__{
+      current_term: current_term,
+      votes_responded: votes_responded,
+      votes_granted: votes_granted
+    } = state) when current_term == term and granted do
+    Logger.debug("receive rpc message #{vote_reply}")
+    # deal the granted vote
+    state = %{state |
+              votes_responded: votes_responded.put(source),
+              votes_granted: votes_granted.put(source)
+             }
 
-  #   end
-  # end
+    # try to became leader
+    if win_election?(state) do
+      # become_leader()
+      last_log_index = state.log |> Raft.Log.last_log_index()
+      peers = state.config |> Raft.Server.Configuration.get_peers()
+      state = %{state |
+                next_indexes: peers |> Enum.map(fn peer ->
+                  {peer, last_log_index + 1}
+                end) |> Map.new(),
+                match_indexes: peers |> Enum.map(fn peer ->
+                  {peer, 0}
+                end) |> Map.new
+               }
+      {:next_state, :leader, state}
+    else
+      {:next_state, :candidate, state}
+    end
+  end
 
   def candidate(
     %AppendEntries{
@@ -171,7 +236,8 @@ defmodule Raft.Consensus do
                current_term: current_term,
                commit_index: commit_index,
                last_applied: last_applied_index,
-               log: log
+               log: log,
+               config: config
              } = state) do
     heartbeat_msg = %AppendEntries{
       term: current_term,
@@ -181,6 +247,7 @@ defmodule Raft.Consensus do
       entries: [],
       leader_commit: commit_index,
     }
+    peers = config |> Raft.Server.Configuration.get_peers()
     for peer <- peers do
       # TODO: implement me
       Raft.RPC.send(peer, heartbeat_msg)
@@ -206,7 +273,7 @@ defmodule Raft.Consensus do
 
       current_term: meta |> Raft.Server.Meta.get_current_term(),
       voted_for: meta |> Raft.Server.Meta.get_voted_for()
-    } |> reset_timer()
+    } |> reset_timer(election_timeout())
 
     state
   end
@@ -257,7 +324,11 @@ defmodule Raft.Consensus do
   end
 
   # After update term, handle request.
-  defp handle_request_vote_request(%__MODULE__{ log: log } = state, vote_req) do
+  defp handle_request_vote_request(%__MODULE__{
+        log: log,
+        current_term: current_term,
+        voted_for: voted_for
+                                   } = state, vote_req) do
     last_term = log |> Raft.Log.last_log_term()
     last_index = log |> Raft.Log.last_log_index()
 
@@ -266,7 +337,7 @@ defmodule Raft.Consensus do
         true
       vote_req.last_log_term == last_term ->
         vote_req.last_log_index >= last_index
-      _ ->
+      true ->
         false
     end
 
@@ -285,4 +356,11 @@ defmodule Raft.Consensus do
     {reply, state}
   end
 
+  def win_election?(%__MODULE__{
+        votes_granted: votes_granted,
+        config: config
+                    } = state) do
+    peers = config |> Raft.Server.Configuration.get_peers()
+    (MapSet.size(votes_granted) + 1) * 2 > length(peers) + 1
+  end
 end
