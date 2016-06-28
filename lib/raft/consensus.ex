@@ -76,19 +76,42 @@ defmodule Raft.Consensus do
     {:reply, state_name, state_name, state}
   end
 
-  def handle_sync_event(%RequestVote{} = vote_req, _from, state_name, state) do
-    # Any RPC with a newer term causes the recipient to advance its term,
-    # and transite to follower.
-    if state.current_term < vote_req.term do
-      state = state |> update_term(vote_req.term)
-      state_name = :follower
+  def handle_event(
+    %RequestVote{term: term} = vote_req, state_name,
+    %__MODULE__{current_term: current_term} = state
+  ) when current_term < term do
+    state = state |> update_term(term)
+    # XXX: just dispatch it
+    handle_event(vote_req, :follower, state)
+  end
+  def handle_event(
+    %RequestVote{term: term} = vote_req,
+    state_name,
+    %__MODULE__{
+      current_term: current_term,
+      log: log,
+      voted_for: voted_for
+    } = state
+  ) when current_term >= term do
+    grant = grant_vote?(state, vote_req)
+
+    if grant do
+      state = %{ state | voted_for: vote_req.source }
     end
 
-    ## Handle RequestVote Request
-    {reply, state} = state |> handle_request_vote_request(vote_req)
+    reply = %RequestVoteReply{
+      term: current_term,
+      vote_granted: grant,
+      source: vote_req.dest,
+      dest: vote_req.source
+    }
 
-    {:reply, reply, state_name, state}
+    Raft.RPC.send_msg(reply.dest, reply)
+
+    {:next_state, state_name, state}
   end
+
+
 
 
   def follower(:timeout, %__MODULE__{ me: me, current_term: current_term, config: config } = state) do
@@ -323,12 +346,26 @@ defmodule Raft.Consensus do
     end
   end
 
-  # After update term, handle request.
-  defp handle_request_vote_request(%__MODULE__{
-        log: log,
-        current_term: current_term,
-        voted_for: voted_for
-                                   } = state, vote_req) do
+  defp grant_vote?(
+    %__MODULE__{
+      current_term: current_term
+    } = state,
+    %RequestVote{
+      term: term
+    } = vote_req
+  ) when current_term > term do
+    false
+  end
+  defp grant_vote?(
+    %__MODULE__{
+      current_term: current_term,
+      voted_for: voted_for,
+      log: log
+    } = state,
+    %RequestVote{
+      term: term
+    } = vote_req
+  ) when current_term == term do
     last_term = log |> Raft.Log.last_log_term()
     last_index = log |> Raft.Log.last_log_index()
 
@@ -341,20 +378,9 @@ defmodule Raft.Consensus do
         false
     end
 
-    grant = vote_req.term == current_term and log_ok and (is_nil(voted_for) or voted_for == vote_req.source)
-
-    if grant do
-      state = %{ state | voted_for: vote_req.source }
-    end
-
-    reply = %RequestVoteReply{
-      term: current_term,
-      vote_granted: grant,
-      source: vote_req.dest,
-      dest: vote_req.source
-    }
-    {reply, state}
+    log_ok && [vote_req.source, nil] |> Enum.member?(voted_for)
   end
+
 
   def win_election?(%__MODULE__{
         votes_granted: votes_granted,

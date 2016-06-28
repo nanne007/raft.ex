@@ -22,7 +22,8 @@ defmodule Raft.Server do
 
   use Supervisor
   def start_link(me) do
-    Supervisor.start_link(__MODULE__, me)
+    {name, _} = me
+    Supervisor.start_link(__MODULE__, name: name)
   end
 
 
@@ -46,10 +47,31 @@ defmodule Raft.Server do
   end
 
 
+  def get_consensus(server) do
+    consensus = server
+    |> Supervisor.which_children()
+    |> List.keyfind(Raft.Server, 0)
+
+    case consensus do
+      nil ->
+        {:error, :not_found}
+      {Raft.Consensus, child, :worker, _modules} ->
+        case child do
+          :undefined ->
+            {:error, :not_found}
+          :restarting ->
+            get_consensus(server)
+          pid ->
+            pid
+        end
+    end
+
+  end
+
   def init(me) do
 
     children = [
-      worker(Raft.Server, [me])
+      worker(Raft.Consensus, [me])
     ]
     options =[
       strategy: :one_for_one,
