@@ -44,7 +44,9 @@ defmodule Raft.RPC do
   defmodule AppendEntries do
     defstruct [
       :term,
-      :leader_id,
+      :source,
+      :dest,
+
       :prev_log_index,
       :prev_log_term,
       :entries,
@@ -53,20 +55,33 @@ defmodule Raft.RPC do
 
     @type t :: %__MODULE__{
       term: Raft.Server.rterm,
-      leader_id: Raft.Server.id,
+      source: Raft.Server.id,
+      dest: Raft.Server.id,
+
       prev_log_index: Raft.Server.index,
       prev_log_term: Raft.Server.rterm,
+
       entries: list(term),
       leader_commit: Raft.Server.index
     }
   end
 
   defmodule AppendEntriesReply do
-    defstruct [:term, :success]
+    defstruct [
+      :term,
+      :source,
+      :dest,
+      :success,
+      :match_index
+    ]
 
     @type t :: %__MODULE__{
       term: Raft.Server.rterm,
-      success: boolean
+      source: Raft.Server.id,
+      dest: Raft.Server.id,
+
+      success: boolean,
+      match_index: Raft.Server.index
     }
   end
 
