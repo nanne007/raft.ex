@@ -24,7 +24,7 @@ defmodule Raft.Server.Meta do
   end
   ### GenServer callbacks
 
-  def init({me}) do
+  def init({_me}) do
     state = %__MODULE__{
       current_term: 0,
       voted_for: nil

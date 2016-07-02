@@ -28,7 +28,9 @@ defmodule Raft.Consensus do
 
     timer: reference,
     meta: pid,
-    config: pid
+    config: pid,
+
+    timer: reference
   }
 
   defstruct [
@@ -49,448 +51,512 @@ defmodule Raft.Consensus do
 
     timer: nil,
     meta: nil,
-    config: nil
+    config: nil,
+
+    timer: nil
   ]
 
-  @behaviour :gen_fsm
+  @behaviour :gen_statem
+  def callback_mode(), do: :handle_event_function
 
   def start_link(me) do
-    :gen_fsm.start_link(__MODULE__, {me})
+    :gen_statem.start_link(__MODULE__, {me}, [])
   end
 
-  def request_vote(pid, params) do
-    pid |> :gem_fsm.sync_send_event({:request_vote, params})
-  end
-
-  def get_state(pid) do
-    pid |> :gem_fsm.sync_send_event(:get_state)
-  end
-
-  #### gen_fsm callbacks
+  #### gen_statem callbacks
 
   def init({me}) do
-    { :ok, :follower, bootstrap(me) }
+    {callback_mode, :follower, bootstrap(me), {:next_event, :became_follower}}
   end
 
-  def handle_sync_event(:get_state, _from, state_name, state) do
-    {:reply, state_name, state_name, state}
+  def code_change(_old_vsn, old_state, old_data, _extra) do
+    {callback_mode(), old_state, old_data}
   end
 
+  def terminate(_reason, _state, _data) do
+    :void
+  end
+
+  #### Follower State ####
+
+
+  # Guard: Update Term
+  # if message's term is greater than current term,
+  # update the term, and transite to :follower. and re-play the request.
   def handle_event(
-    %RequestVote{term: term} = vote_req, state_name,
-    %__MODULE__{current_term: current_term} = state
+    :cast, %{
+      term: term
+    } = rpc,
+    :follower, %__MODULE__{
+      current_term: current_term
+    } = data
   ) when current_term < term do
-    state = state |> update_term(term)
-    # XXX: just dispatch it
-    handle_event(vote_req, :follower, state)
+    data = data |> update_term(term)
+    {:keep_state, data, {:next_event, :internal, rpc}}
+  end
+
+  # Event: becaome_follower.
+  # every trasistion to :follower should go through this to set timer.
+  def handle_event(
+    :internal, :became_follower,
+    :follower, %__MODULE__{} = data
+  ) do
+    data = data |> reset_timer(:election)
+    {:keep_state, data}
+  end
+
+  # Event: RequestVote.
+  def handle_event(
+    :cast, %RequestVote{
+      term: term
+    } = request_vote_req,
+    :follower, %__MODULE__{
+      current_term: current_term
+    } = data
+  ) when current_term > term do
+    # reject the request_vote
+    data |> reject_request_vote(request_vote_req)
+    :keep_state_and_data
   end
   def handle_event(
-    %RequestVote{term: term} = vote_req,
-    state_name,
+    event_type,
+    %RequestVote{
+      term: term
+    } = request_vote_req,
+    :follower,
     %__MODULE__{
       current_term: current_term,
       log: log,
       voted_for: voted_for
-    } = state
-  ) when current_term >= term do
-    grant = grant_vote?(state, vote_req)
+    } = data
+  ) when current_term == term and event_type in [:cast, :internal] do
+    grant = log_ok?(log, request_vote_req) && (voted_for in [nil, request_vote_req.source])
 
-    if grant do
-      state = %{ state | voted_for: vote_req.source }
+
+    data = if grant do
+      # the election timer should be reset after every valid rpc call.
+      data
+      |> accept_request_vote(request_vote_req)
+      |> reset_timer(:election)
+    else
+      _ = data |> reject_request_vote(request_vote_req)
+      data
     end
-
-    reply = %RequestVoteReply{
-      term: current_term,
-      vote_granted: grant,
-      source: vote_req.dest,
-      dest: vote_req.source
-    }
-
-    Raft.RPC.send_msg(reply.dest, reply)
-
-    {:next_state, state_name, state}
+    {:keep_state, data}
   end
 
-#### state-event handler####
-
-  def follower(:timeout, %__MODULE__{ me: me, current_term: current_term, config: config } = state) do
-    {:next_state, :candidate, state |> reset_timer(0) }
-  end
-
-  def follower(
+  # Event: AppendEntries
+  def handle_event(
+    :cast = _event_type,
     %AppendEntries{
-      term: term
-    } = request,
+      term: term,
+    } = append_entries_req,
+    :follower,
     %__MODULE__{
       current_term: current_term
-    } = state
-  ) when current_term < term do
-    state = state |> update_term(term)
-    follower(request, state)
-  end
-  def follower(
-    %AppendEntries{
-      term: term
-    } = request,
-    %__MODULE__{
-      current_term: current_term
-    } = state
+    } = data
   ) when current_term > term do
-    reply = %AppendEntriesReply{
-      term: current_term,
-      source: request.dest,
-      dest: request.source,
-      success: false,
-      match_index: 0
-    }
-
-    request.source |> Raft.RPC.send_msg(reply)
-    {:next_state, :follower, state}
+    data |> refuse_append_entries(append_entries_req)
+    :keep_state_and_data
   end
-  def follower(
+  def handle_event(
+    event_type,
     %AppendEntries{
       term: term
-    } = request,
+    } = append_entries_req,
+    :follower,
     %__MODULE__{
       current_term: current_term,
       log: log
-    } = state
-  ) when current_term == term do
-    log_ok = state.log |> log_ok?(request)
+    } = data
+  ) when current_term == term and (event_type in [:cast, :internal]) do
+    # handle the append_entries request based on the log_ok.
+    log_ok = log |> log_ok?(append_entries_req)
 
-    if !log_ok do
-      reply = %AppendEntriesReply{
-        term: current_term,
-        source: request.dest,
-        dest: request.source,
-
-        success: false,
-        match_index: 0
-      }
-      request.source |> Raft.RPC.send_msg(reply)
-      {:next_state, :follower, state}
+    data = if log_ok do
+      # accept_request
+      data
+      |> accept_append_entries(append_entries_req)
+      |> reset_timer(:election)
     else
-      next_index = request.prev_log_index + 1
-      if length(request.entries) == 0 do
-        # TODO: recheck the meaning of commit_index and when to change it and how?
-        commit_index = request.commit_index
-        reply = %AppendEntriesReply{
-          term: current_term,
-          source: request.dest,
-          dest: request.source,
-
-          success: true,
-          match_index: request.prev_log_index + length(request.entries)
-        }
-        request.source |> Raft.RPC.send_msg(reply)
-        {:next_state, :follower, %{state | commit_index: commit_index}}
-      else
-        last_log_index = log |> Raft.Log.get_last_log_index()
-        cond do
-          next_index = (last_log_index + 1) -> # no conflict: append entries
-            log |> Raft.Log.append(request.entries)
-            {:next_state, :follower, state}
-          next_index < (last_log_index + 1) ->
-            entry = log |> Raft.Log.get(next_index)
-            if entry.term == List.first(request.entries).term do
-              # already done with the request
-              commit_index = request.commit_index
-              reply = %AppendEntriesReply{
-                term: current_term,
-                source: request.dest,
-                dest: request.source,
-
-                success: true,
-                match_index: request.prev_log_index + length(request.entries)
-              }
-              request.source |> Raft.RPC.send_msg(reply)
-              {:next_state, :follower, %{state | commit_index: commit_index}}
-            else
-              # conflict: remove 1 entry
-              log |> Raft.truncate(1)
-              {:next_state, :follower, state}
-            end
-          true ->
-            Logger.error("this should not happen")
-            {:next_state, :follower, state}
-        end
-      end
+      # refuse request
+      _ = data |> refuse_append_entries(append_entries_req)
+      data
     end
+    {:keep_state, data}
+  end
+
+  # Event: :election_timeout.
+  def handle_event(
+    :info = _event_type,
+    :election_timeout = _event_content,
+    :follower,
+    %__MODULE__{
+    } = data
+  ) do
+    data = data |> start_election()
+
+    {:next_state, :candidate, data}
+  end
+
+  def handle_event(
+    _event_type, event_content,
+    :follower, _data
+  ) do
+    Logger.warn("Reveive stale message #{event_content}")
+    :keep_state_and_data
   end
 
 
-  def candidate(:timeout, %__MODULE__{
-        current_term: current_term,
-        me: me,
-        config: config,
-        log: log
-                } = state) do
-    state = %{ state |
-               current_term: current_term + 1,
-               voted_for: nil,
-               votes_responded: %{},
-               votes_granted: %{},
-               voter_log: %{}
-             }
 
-    peers = config |> Raft.Server.Configuration.get_peers()
+  #### Candidate State ####
 
-    last_log_term = log |> Raft.Log.last_log_term()
-    last_applied = log |> Raft.Log.last_log_index()
-    # send request_vote to all peers
-    for peer <- peers do
-      request_vote_req = %RequestVote{
-        source: me,
-        dest: peer,
-        term: current_term,
-        last_log_index: last_applied,
-        last_log_term: last_log_term # TODO: get the last_log_term
-      }
-      Raft.RPC.send_msg(peer, request_vote_req)
+
+  # Guard: Update Term
+  # if message's term is greater than current term,
+  # update the term, and transite to :follower, and re-apply the request.
+  def handle_event(
+    :cast, %{
+      term: term
+    } = rpc,
+    :candidate, %__MODULE__{
+      current_term: current_term
+    } = data
+  ) when current_term < term do
+    data = data |> update_term(term)
+    replay_request = case rpc do
+                       %RequestVote{}   -> true
+                       %AppendEntries{} -> true
+                       _                -> false
+                     end
+    actions = if replay_request do
+      [
+        {:next_event, :internal, rpc}, # replay the request
+        {:next_event, :internal, :became_follower}  # and then became follower
+      ]
+    else
+      [
+        {:next_event, :internal, :became_follower}  # and then became follower
+      ]
     end
-    {:next_state, :candidate, state |> reset_timer(election_timeout())}
+    {:next_state, :follower, data, actions}
   end
 
-  @doc """
-  Candidate handles `RequestVoteReply` from voters.
-  """
-  def candidate(
-    %RequestVoteReply{term: term} = vote_reply,
+  # Event: election_timeout
+  # prev leader_election failed, start a new one.
+  def handle_event(
+    :info = _event_type,
+    :election_timeout = _event_content,
+    :candidate,
     %__MODULE__{
-      current_term: current_term
-    } = state) when current_term < term do
-    Logger.debug("receive rpc message #{vote_reply}")
-    state = state|> update_term(term)
-    # Do nothing here
-    {:next_state, :follower, state}
+    } = data
+  ) do
+    data = data |> start_election()
+
+    {:next_state, :candidate, data}
   end
-  def candidate(
-    %RequestVoteReply{term: term} = vote_reply,
-    %__MODULE__{
+
+  # Event: RequestVote
+  def handle_event(
+    :cast, %RequestVote{
+      term: term
+    } = request_vote_req,
+    :candidate, %__MODULE__{
       current_term: current_term
-    } = state) when current_term > term do # drop stale response
-    Logger.debug("receive stale rpc message #{vote_reply}")
-    {:next_state, :candidate, state}
+    } = data
+  ) when current_term >= term do
+    # just reject the request_vote
+    data |> reject_request_vote(request_vote_req)
+    :keep_state_and_data
   end
-  def candidate(
+
+  # Event: AppendEntries
+  def handle_event(
+    :cast = _event_type, %AppendEntries{
+      term: term
+    } = append_entries_req,
+    :candidate, %__MODULE__{
+      current_term: current_term
+    } = data
+  ) when current_term == term do
+    # Another peer has already win a election, so I just fallback to follower
+    actions = [
+      {:next_event, :internal, append_entries_req},
+      {:next_event, :internal, :became_follower}
+    ]
+    {:next_state, :follower, data, actions}
+  end
+  def handle_event(
+    :cast = _event_type, %AppendEntries{
+      term: term
+    } = append_entries_req,
+    :candidate = _state, %__MODULE__{
+      current_term: current_term
+    } = data
+  ) when current_term > term do
+    data |> refuse_append_entries(append_entries_req)
+    :keep_state_and_data
+  end
+
+  # Event: RequestVoteReply
+  def handle_event(
+    :cast = _event_type, %RequestVoteReply{
+      term: term
+    } = _vote_reply,
+    :candidate = _state, %__MODULE__{
+      current_term: current_term
+    } = _data
+  ) when current_term > term do
+    :keep_state_and_data
+  end
+  def handle_event(
+    :cast = _event_type,
     %RequestVoteReply{
       term: term,
       vote_granted: granted,
       source: source,
-      dest: dest
     } = vote_reply,
+    :candidate = _state,
     %__MODULE__{
       current_term: current_term,
-      votes_responded: votes_responded,
-      votes_granted: votes_granted
-    } = state) when current_term == term and not granted do
+      votes_responded: votes_responded
+    } = data) when current_term == term and not granted do
     Logger.debug("receive rpc message #{vote_reply}")
-    state = %{state | votes_responded: votes_responded.put(source) }
-    {:next_state, :candidate, state}
+    data = %{data | votes_responded: votes_responded.put(source) }
+    {:keep_state, data}
   end
-  def candidate(
+  def handle_event(
+    :cast = _event_type,
     %RequestVoteReply{
       term: term,
       vote_granted: granted,
-      source: source,
-      dest: dest
+      source: source
     } = vote_reply,
+    :candidate,
     %__MODULE__{
       current_term: current_term,
       votes_responded: votes_responded,
       votes_granted: votes_granted
-    } = state) when current_term == term and granted do
+    } = data) when current_term == term and granted do
     Logger.debug("receive rpc message #{vote_reply}")
     # deal the granted vote
-    state = %{state |
+    data = %{data |
               votes_responded: votes_responded.put(source),
               votes_granted: votes_granted.put(source)
-             }
+            }
 
-    # try to became leader
-    if win_election?(state) do
-      # become_leader()
-      last_log_index = state.log |> Raft.Log.last_log_index()
-      peers = state.config |> Raft.Server.Configuration.get_peers()
-      state = %{state |
-                next_indexes: peers |> Enum.map(fn peer ->
-                  {peer, last_log_index + 1}
-                end) |> Map.new(),
-                match_indexes: peers |> Enum.map(fn peer ->
-                  {peer, 0}
-                end) |> Map.new
-               }
-      {:next_state, :leader, state}
+    if win_election?(data) do
+      {:next_state, :leader, data, {:next_event, :internal, :became_leader}}
     else
-      {:next_state, :candidate, state}
+      {:keep_state, data}
     end
   end
 
-  def candidate(
-    %AppendEntries{
-      term: term,
-    } = message, %__MODULE__{
-      current_term: current_term
-    } = state) when current_term < term do
-    state = state |> update_term(term)
-    follower(message, state)
+  def handle_event(
+    :cast, %AppendEntriesReply{},
+    :candidate, _data
+  ) do
+    :keep_state_and_data
   end
 
-  def candidate(
-    %AppendEntries{
+  def handle_event(
+    _event_type, _event_content,
+    :candidate, _data
+  ) do
+    :keep_state_and_data
+  end
+
+
+  #### Leader State ####
+
+
+  # Guard: Update Term
+  # if message's term is greater than current term,
+  # update the term, and transite to :follower, and re-apply the request.
+  def handle_event(
+    :cast, %{
       term: term
-    } = message,
+    } = rpc,
+    :candidate, %__MODULE__{
+      current_term: current_term
+    } = data
+  ) when current_term < term do
+    data = data |> update_term(term)
+    replay_request =
+      case rpc do
+        %RequestVote{}   -> true
+        %AppendEntries{} -> true
+        _                -> false
+        # in fact, no reply whose term is greater than it own,
+        # this situation should not happen.
+      end
+
+    actions = if replay_request do
+      [
+        {:next_event, :internal, rpc}, # replay the request
+        {:next_event, :internal, :became_follower}
+      ]
+    else
+      [
+        {:next_event, :internal, :became_follower}  # and then became follower
+      ]
+    end
+    {:next_state, :follower, data, actions}
+  end
+
+  # Event: became_leader
+  def handle_event(
+    :internal,
+    :became_leader,
+    :leader,
     %__MODULE__{
-      current_term: current_term
-    } = state
-  ) when current_term > term do
-    reply = %AppendEntriesReply{
-      term: current_term,
-      source: message.dest,
-      dest: message.source,
-      success: false,
-      match_index: 0
-    }
-    message.source |> Raft.RPC.send_msg(reply)
-    {:next_state, :candidate, state}
+      log: log,
+      config: config,
+    } = data
+  ) do
+    last_log_index = log |> Raft.Log.get_last_log_index()
+    peers = config |> Raft.Server.Configuration.get_peers()
+
+    init_next_indexes = peers |> Enum.map(fn peer ->
+      {peer, last_log_index + 1}
+    end) |> Map.new()
+    init_match_indexes = peers |> Enum.map(fn peer ->
+      {peer, 0}
+    end) |> Map.new()
+
+    data = %{data |
+             next_indexes: init_next_indexes,
+             match_indexes: init_match_indexes
+            }
+
+    data |> append_entries_to_peers() |> reset_timer(:heartbeat)
+    {:keep_state, data}
   end
-  def candidate(
-    %AppendEntries{
+
+  # Event: heartbeat_timeout
+  def handle_event(
+    :timeout, :heartbeat_timeout,
+    :leader, %__MODULE__{
+    } = data
+  ) do
+    data |> append_entries_to_peers() |> reset_timer(:heartbeat)
+    {:keep_state, data}
+  end
+
+  # Event: AppendEntriesReply
+  def handle_event(
+    :cast = _event_type, %AppendEntriesReply{
       term: term
-    } = message, %__MODULE__{
+    } = _event_content,
+    :leader, %__MODULE__{
       current_term: current_term
-    } = state) when current_term == term do
-    {:next_state, :follower, state}
+    } = _data
+  ) when current_term > term do
+    # Drop stale reply
+    :keep_state_and_data
   end
+  def handle_event(
+    :cast = _event_type, %AppendEntriesReply{
+      term: term,
+      source: source,
+      success: success,
+      match_index: match_index
+    } = _event_content,
+    :leader = _state, %__MODULE__{
+      current_term: current_term,
+      next_indexes: next_indexes,
+      match_indexes: match_indexes
+    } = data
+  ) when current_term == term and success do
+    # Handle successful reply
+    next_indexes = next_indexes |> Map.update!(source, fn _cur ->
+      match_index + 1
+    end)
+    match_indexes = match_indexes |> Map.update!(source, fn _cur ->
+      match_index
+    end)
 
+    data = %{data |
+             next_indexes: next_indexes,
+             match_indexes: match_indexes
+            }
+    {:keep_state, data}
+  end
+  def handle_event(
+    :cast = _event_type, %AppendEntriesReply{
+      term: term,
+      success: success,
+      source: source
+    },
+    :leader = _state, %__MODULE__{
+      current_term: current_term,
+      next_indexes: next_indexes
+    } = data
+  ) when current_term == term and not success do
+    # Handle failed reply, just backoff the next_index
+    next_indexes = next_indexes |> Map.update!(source, fn cur ->
+      max(1, cur - 1)
+    end)
 
+    data = %{data |
+             next_indexes: next_indexes
+            }
+    {:keep_state, data}
+  end
 
   @doc """
    1. append the command to log as a new entry
    2. issue append_entries rpc.
    3. if safely replicated, apply to state machine and return result to client.
   """
-  def leader({:command, command}, %__MODULE__{
-
-             } = state) do
-
-  end
-
-  def leader({:timeout}, %__MODULE__{
-               me: me,
-               current_term: current_term,
-               commit_index: commit_index,
-               next_indexes: next_indexes,
-               log: log,
-               config: config
-             } = state) do
-    peers = config |> Raft.Server.Configuration.get_peers()
-    for peer <- peers do
-      next_index = Map.fetch(next_indexes, peer)
-      relative_prev_log_index = next_index - 1
-      relative_prev_log_term = if relative_prev_log_index > 0 do
-        entry = log |> Raft.Log.get(relative_prev_log_index)
-        entry.term
-      else
-        0
-      end
-
-      log_len = Raft.Log.get_last_log_index(log)
-      last_entry_index = if next_index > log_len do
-        log_len
-      else
-        next_index
-      end
-
-      # XXX: the sub_log should be inclusive.
-      entries = Raft.Log.sub_log(log, next_index, last_entry_index)
-
-      append_entry = %AppendEntries{
-        term: current_term,
-        source: me,
-        dest: peer,
-
-        prev_log_index: relative_prev_log_index,
-        prev_log_term: relative_prev_log_term,
-        entries: entries,
-        leader_commit: min(commit_index, last_entry_index) # TODO: why this comparision?
-      }
-      Raft.RPC.send_msg(peer, append_entry)
-    end
-
-    state = state |> reset_timer(heartbeat_timeout())
-
-    {:next_state, :leader, state}
-  end
-
-  def leader(
-    %AppendEntriesReply{
-      term: term,
-      success: success,
-      match_index: match_index,
-      source: source
-    }, %__MODULE__{
-      current_term: current_term
-    } = state) when current_term == term and success do
-    next_indexes = state.next_indexes |> Map.update!(source, fn _cur ->
-      match_index + 1
-    end)
-    match_indexes = state.match_indexes |> Map.update!(source, fn _cur ->
-      match_index
-    end)
-
-    state = %{state |
-              next_indexes: next_indexes,
-              match_indexes: match_indexes
-             }
-    {:next_state, :leader, state}
-  end
-  def leader(
-    %AppendEntriesReply{
-      term: term,
-      success: success,
-      source: source
-    }, %__MODULE__{
-      current_term: current_term
-    } = state) when current_term == term and not success do
-    next_indexes = state.next_indexes |> Map.update!(source, fn cur ->
-      max(1, cur - 1)
-    end)
-
-    state = %{state |
-              next_indexes: next_indexes
-             }
-    {:next_state, :leader, state}
+  def handle_event(
+    :cast,
+    {:command, _command},
+    :leader,
+    %__MODULE__{
+    } = _data) do
+    # TODO: implement me
+    :keep_state_and_data
   end
 
 
+  # Event: Any others
+  def handle_event(
+    _event_type, _event_content,
+    :leader, _data
+  ) do
+    :keep_state_and_data
+  end
 
+  # bootstrap from durable device
   defp bootstrap(me) do
     {:ok, meta} = Raft.Server.Meta.start_link(me)
     {:ok, config} = Raft.Server.Configuration.start_link(me)
-    state = %__MODULE__{
+    data = %__MODULE__{
       me: me,
       meta: meta,
       config: config,
 
       current_term: meta |> Raft.Server.Meta.get_current_term(),
       voted_for: meta |> Raft.Server.Meta.get_voted_for()
-    } |> reset_timer(election_timeout())
-
-    state
+    }
+    data
   end
 
-
-
-  defp reset_timer(%__MODULE__{timer: timer} = state, timeout) do
-    unless is_nil(timer) do
-      timer |> :gen_fsm.cancel_timer()
-    end
-
-    new_timer = :gen_fsm.send_event_after(timeout, :timeout)
-
-    %{state | timer: new_timer}
+  defp reset_timer(%__MODULE__{timer: timer} = data, kind)
+  when kind in [:election, :heartbeat] and is_reference(timer) do
+    Process.cancel_timer(timer)
+    %{data | timer: nil} |> reset_timer(kind)
   end
+  defp reset_timer(%__MODULE__{timer: nil} = data, :election) do
+    timer = Process.send_after(self(), :election_timeout, election_timeout())
+    %{data | timer: timer}
+  end
+  defp reset_timer(%__MODULE__{timer: nil} = data, :heartbeat) do
+    timer = Process.send_after(self(), :hearbeat_timeout, heartbeat_timeout())
+    %{data | timer: timer}
+  end
+
 
   @heartbeat_timeout_min 50
   @heartbeat_timeout_max 200
@@ -508,79 +574,100 @@ defmodule Raft.Consensus do
     :crypto.rand_uniform min_timeout, max_timeout + 1
   end
 
-  def peers(%__MODULE__{ config: config } = _state) do
-    config |> Raft.Server.Configuration.get_peers()
+  defp start_election(
+    %__MODULE__{
+      me: me,
+      current_term: current_term,
+      config: config,
+      log: log
+    } = data) do
+    # 1. increase term number, and init vote state variables.
+    data = %{data |
+             current_term: current_term + 1,
+             voted_for: nil,
+             votes_responded: %{},
+             votes_granted: %{},
+             voter_log: %{}
+            }
+
+    # 2. send request_vote rpc to all peers
+    peers = config |> Raft.Server.Configuration.get_peers()
+
+    last_log_term = log |> Raft.Log.get_last_log_term()
+    last_log_index = log |> Raft.Log.get_last_log_index()
+    # send request_vote to all peers
+    for peer <- peers do
+      request_vote_req = %RequestVote{
+        source: me,
+        dest: peer,
+        term: current_term,
+        last_log_index: last_log_index,
+        last_log_term: last_log_term
+      }
+      Raft.RPC.send_msg(peer, request_vote_req)
+    end
+
+    data |> reset_timer(:election)
   end
 
   # Any RPC with a newer term causes the recipient to advance its term first.
   # and transit to follower.
-  defp update_term(%__MODULE__{} = state, term) do
-    if state.current_term < term do
-      %{state |
+  defp update_term(%__MODULE__{current_term: current_term} = data, term) do
+    if current_term < term do
+      %{data |
         current_term: term,
         voted_for: nil
       }
     else
-      state
+      data
     end
   end
 
-  defp grant_vote?(
+
+  defp win_election?(
     %__MODULE__{
-      current_term: current_term
-    } = state,
-    %RequestVote{
-      term: term
-    } = vote_req
-  ) when current_term > term do
-    false
-  end
-  defp grant_vote?(
-    %__MODULE__{
-      current_term: current_term,
-      voted_for: voted_for,
-      log: log
-    } = state,
-    %RequestVote{
-      term: term
-    } = vote_req
-  ) when current_term == term do
-    last_term = log |> Raft.Log.last_log_term()
-    last_index = log |> Raft.Log.last_log_index()
-
-    log_ok = cond do
-      vote_req.last_log_term > last_term ->
-        true
-      vote_req.last_log_term == last_term ->
-        vote_req.last_log_index >= last_index
-      true ->
-        false
-    end
-
-    log_ok && [vote_req.source, nil] |> Enum.member?(voted_for)
-  end
-
-
-  defp win_election?(%__MODULE__{
-        votes_granted: votes_granted,
-        config: config
-                    } = state) do
+      votes_granted: votes_granted,
+      config: config
+    }
+  ) do
     peers = config |> Raft.Server.Configuration.get_peers()
     (MapSet.size(votes_granted) + 1) * 2 > length(peers) + 1
   end
 
+
   defp log_ok?(log,
+    %RequestVote{
+    } = vote_req
+  ) do
+    last_log_term = log |> Raft.Log.get_last_log_term()
+
+    log_ok = cond do
+      vote_req.last_log_term > last_log_term ->
+        true
+      vote_req.last_log_term == last_log_term ->
+        last_log_index = log |> Raft.Log.get_last_log_index()
+        vote_req.last_log_index >= last_log_index
+      :else ->
+        false
+    end
+    log_ok
+  end
+
+
+  defp log_ok?(_log,
     %AppendEntries{
       prev_log_index: prev_log_index
-    }) when prev_log_index == 0 do
+    }
+  ) when prev_log_index == 0 do
     true
   end
   defp log_ok?(log,
     %AppendEntries{
       prev_log_index: prev_log_index,
       prev_log_term: prev_log_term
-    }) when prev_log_index > 0 do
-    last_log_index = log |> Raft.Log.last_log_index()
+    }
+  ) when prev_log_index > 0 do
+    last_log_index = log |> Raft.Log.get_last_log_index()
     if prev_log_index > last_log_index do
       false
     else
@@ -588,7 +675,170 @@ defmodule Raft.Consensus do
       prev_log_term == entry.term
     end
   end
+  defp reject_request_vote(
+    %__MODULE__{
+      current_term: current_term
+    },
+    %RequestVote{
+      source: source,
+      dest: dest
+    }
+  ) do
+    reply = %RequestVoteReply{
+      term: current_term,
+      vote_granted: false,
+      source: dest,
+      dest: source
+    }
+    reply.dest |> Raft.RPC.send_msg(reply)
+  end
+  defp accept_request_vote(
+    %__MODULE__{
+      current_term: current_term
+    } = data,
+    %RequestVote{
+      source: source,
+      dest: dest
+    }
+  ) do
+    reply = %RequestVoteReply{
+      term: current_term,
+      vote_granted: true,
+      source: dest,
+      dest: source
+    }
+    reply.dest |> Raft.RPC.send_msg(reply)
+    %{data |
+      voted_for: source
+    }
+  end
+
+  defp refuse_append_entries(
+    %__MODULE__{
+      current_term: current_term
+    },
+    %AppendEntries{
+      source: source,
+      dest: dest
+    }
+  ) do
+    reply = %AppendEntriesReply{
+      term: current_term,
+      source: dest,
+      dest: source,
+      success: false,
+      match_index: 0
+    }
+    source |> Raft.RPC.send_msg(reply)
+  end
+
+  defp accept_append_entries(
+    %__MODULE__{
+      current_term: current_term
+    } = data,
+    %AppendEntries{
+      source: source,
+      dest: dest,
+      prev_log_index: prev_log_index,
+      entries: entries
+    } = append_entries_req
+  ) when length(entries) == 0 do
+    reply = %AppendEntriesReply{
+      term: current_term,
+      source: dest,
+      dest: source,
+
+      success: true,
+      match_index: prev_log_index + length(entries)
+    }
+    reply.dest |> Raft.RPC.send_msg(reply)
+
+    # TODO: recheck the meaning of commit_index and when to change it and how?
+    %{data | commit_index: append_entries_req.commit_index}
+  end
+  defp accept_append_entries(
+    %__MODULE__{
+      current_term: current_term,
+      log: log
+    } = data,
+    %AppendEntries{
+      source: source,
+      dest: dest,
+      prev_log_index: prev_log_index,
+      entries: entries
+    } = append_entries_req
+  ) when length(entries) > 0 do
+    last_log_index = log |> Raft.Log.get_last_log_index()
+    cond do
+      prev_log_index == last_log_index -> # no conflict: append entries
+        log |> Raft.Log.append(entries)
+        data
+      prev_log_index < last_log_index ->
+        entry = log |> Raft.Log.get(prev_log_index + 1)
+        if entry.term != List.first(entries).term do
+          # conflict: remove 1 entry to do backoff
+          log |> Raft.truncate(1)
+          data
+        else
+          # already done with the request
+          reply = %AppendEntriesReply{
+            term: current_term,
+            source: dest,
+            dest: source,
+
+            success: true,
+            match_index: prev_log_index + length(entries)
+          }
+          reply.dest |> Raft.RPC.send_msg(reply)
+          # TODO: also here
+          %{data | commit_index: append_entries_req.commit_index}
+        end
+      true ->
+        Logger.error("this should not happen")
+        :keep_state_and_data
+    end
+  end
 
 
+  defp append_entries_to_peers(
+    %__MODULE__{
+      me: me,
+      current_term: current_term,
+      commit_index: commit_index,
+      next_indexes: next_indexes,
+      log: log,
+      config: config
+    }
+  ) do
+    peers = config |> Raft.Server.Configuration.get_peers()
+    for peer <- peers do
+      next_index = Map.fetch(next_indexes, peer)
+      relative_prev_log_index = next_index - 1
+      relative_prev_log_term = cond do
+        relative_prev_log_index > 0 -> Raft.Log.get(log, relative_prev_log_index).term
+        :else                       -> 0
+      end
+      entries_size = cond do
+        relative_prev_log_index == Raft.Log.get_last_log_index(log) -> 0
+        :else                                                       -> 1
+      end
+
+      # XXX: the sub_log should be inclusive.
+      entries = Raft.Log.sub_log(log, next_index, entries_size)
+      last_entry_index = next_index + entries_size - 1
+
+      append_entries_req = %AppendEntries{
+        term: current_term,
+        source: me,
+        dest: peer,
+
+        prev_log_index: relative_prev_log_index,
+        prev_log_term: relative_prev_log_term,
+        entries: entries,
+        leader_commit: min(commit_index, last_entry_index) # TODO: why this comparision?
+      }
+      append_entries_req.dest |> Raft.RPC.send_msg(append_entries_req)
+    end
+  end
 
 end

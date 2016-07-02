@@ -85,23 +85,21 @@ defmodule Raft.RPC do
     }
   end
 
-  def send_msg(peer, %RequestVote{} = message) do
+
+  @doc """
+  send message to peer, four message types:
+  1. RequestVote
+  2. RequestVoteReply
+  3. AppendEntries
+  4. AppendEntriesReply
+  """
+  def send_msg(peer, message) do
     {name, node} = peer
     args = [name, message]
     :rpc.cast(node, Raft.RPC, :handle_msg, args)
   end
 
-  def send_msg(peer, %RequestVoteReply{} = message) do
-    {name, node} = peer
-    args = [name, message]
-    :rpc.cast(node, Raft.RPC, :handle_msg, args)
+  def handle_msg(name, message) do
+    name |> Raft.Server.get_consensus() |> :gen_statem.cast(message)
   end
-
-  def handle_msg(name, %RequestVote{} = message) do
-    name |> Raft.Server.get_consensus() |> :gem_fsm.send_all_state_event(message)
-  end
-  def handle_msg(name, %RequestVoteReply{} = message) do
-    name |> Raft.Server.get_consensus() |> :gem_fsm.send_all_state_event(message)
-  end
-
 end
