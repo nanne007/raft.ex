@@ -2,6 +2,7 @@ defmodule Raft.Consensus do
   require Logger
   use Raft.RPC
 
+
   @typedoc """
   state of server
   """
@@ -26,7 +27,6 @@ defmodule Raft.Consensus do
     next_indexes: Map.t,
     match_indexes: Map.t,
 
-    timer: reference,
     meta: pid,
     config: pid,
 
@@ -35,21 +35,24 @@ defmodule Raft.Consensus do
 
   defstruct [
     me: nil,
+    # server vars
     current_term: 0,
-
     voted_for: nil,
-    votes_responded: %{},
-    votes_granted: %{},
-    voter_log: %{},
-    log: nil,
 
+    # log vars
+    log: nil,
     commit_index: 0,
     last_applied: 0,
 
+    # candidate vars
+    votes_responded: %{},
+    votes_granted: %{},
+    voter_log: %{},
+
+    # leader vars
     next_indexes: %{},
     match_indexes: %{},
 
-    timer: nil,
     meta: nil,
     config: nil,
 
@@ -414,7 +417,7 @@ defmodule Raft.Consensus do
       config: config,
     } = data
   ) do
-    last_log_index = log |> Raft.Log.get_last_log_index()
+    last_log_index = log |> Raft.Log.Memory.get_last_log_index()
     peers = config |> Raft.Server.Configuration.get_peers()
 
     init_next_indexes = peers |> Enum.map(fn peer ->
@@ -532,11 +535,12 @@ defmodule Raft.Consensus do
   defp bootstrap(me) do
     {:ok, meta} = Raft.Server.Meta.start_link(me)
     {:ok, config} = Raft.Server.Configuration.start_link(me)
+    {:ok, log} = Raft.Log.Memory.start_link(me)
     data = %__MODULE__{
       me: me,
       meta: meta,
       config: config,
-
+      log: log,
       current_term: meta |> Raft.Server.Meta.get_current_term(),
       voted_for: meta |> Raft.Server.Meta.get_voted_for()
     }
@@ -593,8 +597,8 @@ defmodule Raft.Consensus do
     # 2. send request_vote rpc to all peers
     peers = config |> Raft.Server.Configuration.get_peers()
 
-    last_log_term = log |> Raft.Log.get_last_log_term()
-    last_log_index = log |> Raft.Log.get_last_log_index()
+    last_log_term = log |> Raft.Log.Memory.get_last_log_term()
+    last_log_index = log |> Raft.Log.Memory.get_last_log_index()
     # send request_vote to all peers
     for peer <- peers do
       request_vote_req = %RequestVote{
@@ -639,13 +643,13 @@ defmodule Raft.Consensus do
     %RequestVote{
     } = vote_req
   ) do
-    last_log_term = log |> Raft.Log.get_last_log_term()
+    last_log_term = log |> Raft.Log.Memory.get_last_log_term()
 
     log_ok = cond do
       vote_req.last_log_term > last_log_term ->
         true
       vote_req.last_log_term == last_log_term ->
-        last_log_index = log |> Raft.Log.get_last_log_index()
+        last_log_index = log |> Raft.Log.Memory.get_last_log_index()
         vote_req.last_log_index >= last_log_index
       :else ->
         false
@@ -667,11 +671,11 @@ defmodule Raft.Consensus do
       prev_log_term: prev_log_term
     }
   ) when prev_log_index > 0 do
-    last_log_index = log |> Raft.Log.get_last_log_index()
+    last_log_index = log |> Raft.Log.Memory.get_last_log_index()
     if prev_log_index > last_log_index do
       false
     else
-      entry = log |> Raft.Log.get(prev_log_index)
+      entry = log |> Raft.Log.Memory.get(prev_log_index)
       prev_log_term == entry.term
     end
   end
@@ -768,16 +772,16 @@ defmodule Raft.Consensus do
       entries: entries
     } = append_entries_req
   ) when length(entries) > 0 do
-    last_log_index = log |> Raft.Log.get_last_log_index()
+    last_log_index = log |> Raft.Log.Memory.get_last_log_index()
     cond do
       prev_log_index == last_log_index -> # no conflict: append entries
-        log |> Raft.Log.append(entries)
+        log |> Raft.Log.Memory.append(entries)
         data
       prev_log_index < last_log_index ->
-        entry = log |> Raft.Log.get(prev_log_index + 1)
+        entry = log |> Raft.Log.Memory.get(prev_log_index + 1)
         if entry.term != List.first(entries).term do
           # conflict: remove 1 entry to do backoff
-          log |> Raft.truncate(1)
+          log |> Raft.Log.Memory.truncate(1)
           data
         else
           # already done with the request
@@ -815,16 +819,16 @@ defmodule Raft.Consensus do
       next_index = Map.fetch(next_indexes, peer)
       relative_prev_log_index = next_index - 1
       relative_prev_log_term = cond do
-        relative_prev_log_index > 0 -> Raft.Log.get(log, relative_prev_log_index).term
+        relative_prev_log_index > 0 -> Raft.Log.Memory.get(log, relative_prev_log_index).term
         :else                       -> 0
       end
       entries_size = cond do
-        relative_prev_log_index == Raft.Log.get_last_log_index(log) -> 0
+        relative_prev_log_index == Raft.Log.Memory.get_last_log_index(log) -> 0
         :else                                                       -> 1
       end
 
       # XXX: the sub_log should be inclusive.
-      entries = Raft.Log.sub_log(log, next_index, entries_size)
+      entries = Raft.Log.Memory.sub_log(log, next_index, entries_size)
       last_entry_index = next_index + entries_size - 1
 
       append_entries_req = %AppendEntries{

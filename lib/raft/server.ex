@@ -15,10 +15,24 @@ defmodule Raft.Server do
   """
   @type index :: non_neg_integer
 
+
   @typedoc """
   entry of log
   """
-  @type entry :: {rterm, term}
+  @type entry :: Entry.t
+  defmodule Entry do
+    @type t :: %__MODULE__{
+      index: Raft.Sever.index,
+      term: Raft.Server.rterm,
+      content: term
+    }
+    defstruct [
+      index: nil,
+      term: nil,
+      content: nil
+    ]
+  end
+
 
   use Supervisor
   def start_link(me) do
