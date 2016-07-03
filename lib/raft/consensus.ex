@@ -483,7 +483,9 @@ defmodule Raft.Consensus do
              next_indexes: next_indexes,
              match_indexes: match_indexes
             }
-    {:keep_state, data}
+    {:keep_state, data,
+     {:next_event, :internal, {:advance_commit_index, match_index}}
+    }
   end
   def handle_event(
     :cast = _event_type, %AppendEntriesReply{
@@ -504,7 +506,34 @@ defmodule Raft.Consensus do
     data = %{data |
              next_indexes: next_indexes
             }
-    {:keep_state, data}
+    {:keep_state, data,
+     {:next_event, :internal, {:advance_commit_index, next_indexes |> Map.fetch!(source)} }
+    }
+  end
+
+  # Event: advance commit index
+  def handle_event(
+    :internal = _event_type, {:advance_commit_index, hint},
+    :leader = _state, %__MODULE__{
+      config: config,
+      log: log,
+      commit_index: commit_index,
+      match_indexes: match_indexes
+    } = data
+  ) do
+    last_log_index = log |> Raft.Log.Memory.get_last_log_index()
+
+    peer_size = match_indexes |> Enum.count()
+    # find the biggest log index that most peers agree on.
+    new_commit_index =
+      Enum.find(Range.new(commit_index, last_log_index), last_log_index + 1, fn index ->
+        agree_on_index = match_indexes
+        |> Enum.filter(fn {_k, v} -> v >= index end)
+        |> Enum.count()
+        (agree_on_index + 1) * 2 <= (peer_size + 1)
+      end) - 1
+
+    {:keep_state, %{data | commit_index: new_commit_index}}
   end
 
   @doc """
