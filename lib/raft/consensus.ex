@@ -7,20 +7,20 @@ defmodule Raft.Consensus do
   state of server
   """
   @type t :: %__MODULE__{
-    me: Raft.Server.id,
+    me: Raft.Supervisor.id,
 
     ## server vars
-    current_term: Raft.Server.rterm,
-    voted_for: Raft.Server.id,
+    current_term: Raft.Supervisor.rterm,
+    voted_for: Raft.Supervisor.id,
 
     # log vars
     log: pid,
-    commit_index: Raft.Server.index,
-    last_applied: Raft.Server.index,
+    commit_index: Raft.Supervisor.index,
+    last_applied: Raft.Supervisor.index,
 
     ## candidate vars
-    votes_responded: Map.t,
-    votes_granted: Map.t,
+    votes_responded: MapSet.t,
+    votes_granted: MapSet.t,
     voter_log: Mapt.t,
 
     ## leader vars
@@ -45,8 +45,8 @@ defmodule Raft.Consensus do
     last_applied: 0,
 
     # candidate vars
-    votes_responded: %{},
-    votes_granted: %{},
+    votes_responded: MapSet.new,
+    votes_granted: MapSet.new,
     voter_log: %{},
 
     # leader vars
@@ -62,14 +62,14 @@ defmodule Raft.Consensus do
   @behaviour :gen_statem
   def callback_mode(), do: :handle_event_function
 
-  def start_link(me) do
-    :gen_statem.start_link(__MODULE__, {me}, [])
+  def start_link(me, peers) do
+    :gen_statem.start_link(__MODULE__, {me, peers}, [])
   end
 
   #### gen_statem callbacks
 
-  def init({me}) do
-    {callback_mode, :follower, bootstrap(me), {:next_event, :became_follower}}
+  def init({me, peers}) do
+    {callback_mode, :follower, bootstrap(me, peers), {:next_event, :internal, :became_follower}}
   end
 
   def code_change(_old_vsn, old_state, old_data, _extra) do
@@ -195,18 +195,21 @@ defmodule Raft.Consensus do
     :election_timeout = _event_content,
     :follower,
     %__MODULE__{
+      current_term: current_term
     } = data
   ) do
-    data = data |> start_election()
-
-    {:next_state, :candidate, data}
+    {:next_state, :candidate,
+     %{data |
+       current_term: current_term + 1
+     },
+     {:next_event, :internal, :became_candidate}
+    }
   end
 
   def handle_event(
     _event_type, event_content,
     :follower, _data
   ) do
-    Logger.warn("Reveive stale message #{event_content}")
     :keep_state_and_data
   end
 
@@ -252,12 +255,50 @@ defmodule Raft.Consensus do
     :election_timeout = _event_content,
     :candidate,
     %__MODULE__{
+      current_term: current_term
     } = data
   ) do
-    data = data |> start_election()
-
-    {:next_state, :candidate, data}
+    {:keep_state,
+     %{data |
+       current_term: current_term + 1
+     },
+     {:next_event, :internal, :became_candidate}
+    }
   end
+
+  def handle_event(
+    :internal, :became_candidate,
+    :candidate, %__MODULE__{
+      me: me,
+      current_term: current_term,
+      config: config,
+      log: log
+    } = data
+  ) do
+    data = %{data |
+             voted_for: me, # vote for myself
+             votes_responded: MapSet.new,
+             votes_granted: MapSet.new,
+             voter_log: %{}
+            } |> reset_timer(:election)
+    # send request_vote rpc to all peers
+    peers = config |> Raft.Supervisor.Configuration.get_peers()
+
+    last_log_term = log |> Raft.Log.Memory.get_last_log_term()
+    last_log_index = log |> Raft.Log.Memory.get_last_log_index()
+    for peer <- peers do
+      request_vote_req = %RequestVote{
+        source: me,
+        dest: peer,
+        term: current_term,
+        last_log_index: last_log_index,
+        last_log_term: last_log_term
+      }
+      Raft.RPC.send_msg(peer, request_vote_req)
+    end
+    {:keep_state, data}
+  end
+
 
   # Event: RequestVote
   def handle_event(
@@ -324,8 +365,9 @@ defmodule Raft.Consensus do
       current_term: current_term,
       votes_responded: votes_responded
     } = data) when current_term == term and not granted do
-    Logger.debug("receive rpc message #{vote_reply}")
-    data = %{data | votes_responded: votes_responded.put(source) }
+    data = %{data |
+             votes_responded: votes_responded |> MapSet.put(source)
+            }
     {:keep_state, data}
   end
   def handle_event(
@@ -341,11 +383,10 @@ defmodule Raft.Consensus do
       votes_responded: votes_responded,
       votes_granted: votes_granted
     } = data) when current_term == term and granted do
-    Logger.debug("receive rpc message #{vote_reply}")
     # deal the granted vote
     data = %{data |
-              votes_responded: votes_responded.put(source),
-              votes_granted: votes_granted.put(source)
+             votes_responded: votes_responded |> MapSet.put(source),
+             votes_granted: votes_granted |> MapSet.put(source)
             }
 
     if win_election?(data) do
@@ -393,7 +434,6 @@ defmodule Raft.Consensus do
         # in fact, no reply whose term is greater than it own,
         # this situation should not happen.
       end
-
     actions = if replay_request do
       [
         {:next_event, :internal, rpc}, # replay the request
@@ -418,7 +458,7 @@ defmodule Raft.Consensus do
     } = data
   ) do
     last_log_index = log |> Raft.Log.Memory.get_last_log_index()
-    peers = config |> Raft.Server.Configuration.get_peers()
+    peers = config |> Raft.Supervisor.Configuration.get_peers()
 
     init_next_indexes = peers |> Enum.map(fn peer ->
       {peer, last_log_index + 1}
@@ -432,17 +472,19 @@ defmodule Raft.Consensus do
              match_indexes: init_match_indexes
             }
 
-    data |> append_entries_to_peers() |> reset_timer(:heartbeat)
+    data |> append_entries_to_peers()
+    data = data |> reset_timer(:heartbeat)
     {:keep_state, data}
   end
 
   # Event: heartbeat_timeout
   def handle_event(
-    :timeout, :heartbeat_timeout,
+    :info, :heartbeat_timeout,
     :leader, %__MODULE__{
     } = data
   ) do
-    data |> append_entries_to_peers() |> reset_timer(:heartbeat)
+    data |> append_entries_to_peers()
+    data = data |> reset_timer(:heartbeat)
     {:keep_state, data}
   end
 
@@ -561,17 +603,15 @@ defmodule Raft.Consensus do
   end
 
   # bootstrap from durable device
-  defp bootstrap(me) do
-    {:ok, meta} = Raft.Server.Meta.start_link(me)
-    {:ok, config} = Raft.Server.Configuration.start_link(me)
+  defp bootstrap(me, peers) do
+    {:ok, config} = Raft.Supervisor.Configuration.start_link(me, peers)
     {:ok, log} = Raft.Log.Memory.start_link(me)
     data = %__MODULE__{
       me: me,
-      meta: meta,
       config: config,
       log: log,
-      current_term: meta |> Raft.Server.Meta.get_current_term(),
-      voted_for: meta |> Raft.Server.Meta.get_voted_for()
+      current_term: 0,
+      voted_for: nil
     }
     data
   end
@@ -586,7 +626,7 @@ defmodule Raft.Consensus do
     %{data | timer: timer}
   end
   defp reset_timer(%__MODULE__{timer: nil} = data, :heartbeat) do
-    timer = Process.send_after(self(), :hearbeat_timeout, heartbeat_timeout())
+    timer = Process.send_after(self(), :heartbeat_timeout, heartbeat_timeout())
     %{data | timer: timer}
   end
 
@@ -605,42 +645,6 @@ defmodule Raft.Consensus do
     min_timeout = Application.get_env(:raft, :election_timeout_min, @election_timeout_min)
     max_timeout = Application.get_env(:raft, :election_timeout_max, @election_timeout_max)
     :crypto.rand_uniform min_timeout, max_timeout + 1
-  end
-
-  defp start_election(
-    %__MODULE__{
-      me: me,
-      current_term: current_term,
-      config: config,
-      log: log
-    } = data) do
-    # 1. increase term number, and init vote state variables.
-    data = %{data |
-             current_term: current_term + 1,
-             voted_for: nil,
-             votes_responded: %{},
-             votes_granted: %{},
-             voter_log: %{}
-            }
-
-    # 2. send request_vote rpc to all peers
-    peers = config |> Raft.Server.Configuration.get_peers()
-
-    last_log_term = log |> Raft.Log.Memory.get_last_log_term()
-    last_log_index = log |> Raft.Log.Memory.get_last_log_index()
-    # send request_vote to all peers
-    for peer <- peers do
-      request_vote_req = %RequestVote{
-        source: me,
-        dest: peer,
-        term: current_term,
-        last_log_index: last_log_index,
-        last_log_term: last_log_term
-      }
-      Raft.RPC.send_msg(peer, request_vote_req)
-    end
-
-    data |> reset_timer(:election)
   end
 
   # Any RPC with a newer term causes the recipient to advance its term first.
@@ -663,7 +667,7 @@ defmodule Raft.Consensus do
       config: config
     }
   ) do
-    peers = config |> Raft.Server.Configuration.get_peers()
+    peers = config |> Raft.Supervisor.Configuration.get_peers()
     (MapSet.size(votes_granted) + 1) * 2 > length(peers) + 1
   end
 
@@ -787,7 +791,7 @@ defmodule Raft.Consensus do
     reply.dest |> Raft.RPC.send_msg(reply)
 
     # TODO: recheck the meaning of commit_index and when to change it and how?
-    %{data | commit_index: append_entries_req.commit_index}
+    %{data | commit_index: append_entries_req.leader_commit}
   end
   defp accept_append_entries(
     %__MODULE__{
@@ -824,7 +828,7 @@ defmodule Raft.Consensus do
           }
           reply.dest |> Raft.RPC.send_msg(reply)
           # TODO: also here
-          %{data | commit_index: append_entries_req.commit_index}
+          %{data | commit_index: append_entries_req.leader_commit}
         end
       true ->
         Logger.error("this should not happen")
@@ -843,9 +847,9 @@ defmodule Raft.Consensus do
       config: config
     }
   ) do
-    peers = config |> Raft.Server.Configuration.get_peers()
+    peers = config |> Raft.Supervisor.Configuration.get_peers()
     for peer <- peers do
-      next_index = Map.fetch(next_indexes, peer)
+      next_index = Map.fetch!(next_indexes, peer)
       relative_prev_log_index = next_index - 1
       relative_prev_log_term = cond do
         relative_prev_log_index > 0 -> Raft.Log.Memory.get(log, relative_prev_log_index).term

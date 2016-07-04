@@ -1,33 +1,74 @@
 defmodule Raft.Supervisor do
   use Supervisor
+  @typedoc """
+  server identity.
+  """
+  @type id :: term
 
-  @type opts :: [
-    name: String.t,
-    host: :inet.ip_address,
-    port: :inet.port_number,
-    backend: module
-  ]
-  def start_link do
-    Supervisor.start_link(__MODULE__, [], name: __MODULE__)
+  @typedoc """
+  number of leader's term of office
+  """
+  @type rterm :: non_neg_integer
+
+  @typedoc """
+  index of log
+  """
+  @type index :: non_neg_integer
+
+
+  @typedoc """
+  entry of log
+  """
+  @type entry :: Entry.t
+  defmodule Entry do
+    @type t :: %__MODULE__{
+      index: Raft.Supervisor.index,
+      term: Raft.Supervisor.rterm,
+      content: term
+    }
+    defstruct [
+      index: nil,
+      term: nil,
+      content: nil
+    ]
   end
 
-  @doc """
-  Start a raft server with `name`, listening on `host`, 'port'.
-  """
-  @spec start_consensus(opts) :: pid
-  def start_consensus(opts) do
-    name = Keyword.get(opts, :name, UUID.uuid4)
-    host = Keyword.get(opts, :host, {0, 0, 0, 0})
-    port = Keyword.get(opts, :port, 9966)
-    backend = Keyword.get(opts, :backend)
-    child = consensus_worker_spec({name, host, port, backend})
-    Supervisor.start_child(__MODULE__, child) |> start_result()
+  def start_link(me, servers) do
+    if not me in servers do
+      raise "#{me} should be in #{servers}"
+    end
+
+    {name, _} = me
+    peers = servers |> Keyword.delete(name)
+    Supervisor.start_link(__MODULE__, [me, peers], name: name)
+  end
+
+  def get_consensus(sup) do
+    consensus = sup
+    |> Supervisor.which_children()
+    |> List.keyfind(Raft.Consensus, 0)
+
+    case consensus do
+      nil ->
+        {:error, :not_found}
+      {Raft.Consensus, child, :worker, _modules} ->
+        case child do
+          :undefined ->
+            {:error, :not_found}
+          :restarting ->
+            get_consensus(sup)
+          pid ->
+            pid
+        end
+    end
   end
 
   ### Supervisor Callbacks
 
-  def init([]) do
-    children = []
+  def init([me, peers]) do
+    children = [
+      worker(Raft.Consensus, [me, peers])
+    ]
     options = [
       strategy: :one_for_one,
       max_restarts: 2,
@@ -36,25 +77,4 @@ defmodule Raft.Supervisor do
 
     supervise(children, options)
   end
-
-  defp consensus_worker_spec({name, _host, _port, _backend} = me) do
-    supervisor(Raft.Consensus, [me], id: name)
-  end
-
-
-  defp start_result(result) do
-    case result do
-      {:ok, c} ->
-        {:ok, c}
-      {:ok, c, _info} ->
-        {:ok, c}
-      {:error, {:already_started, _c}} ->
-        {:error, :already_created}
-      {:error, {:already_present}} ->
-        {:error, :already_created}
-      {:error, _t} = err ->
-        err
-    end
-  end
-
 end

@@ -30,7 +30,7 @@ defmodule Raft.Log.Memory do
 
 
   @type t :: %__MODULE__{
-    entries: list(Raft.Server.entry)
+    entries: list(Raft.Supervisor.entry)
   }
   defstruct [
     entries: []
@@ -47,7 +47,7 @@ defmodule Raft.Log.Memory do
       entries: entries
     } = data
   ) do
-    {:reply, entries.len, data}
+    {:reply, length(entries), data}
   end
 
 
@@ -58,7 +58,7 @@ defmodule Raft.Log.Memory do
     } = data
   ) do
     last_entry = entries |> Enum.at(length(entries) - 1,
-      %Raft.Server.Entry{
+      %Raft.Supervisor.Entry{
         term: 0
       })
 

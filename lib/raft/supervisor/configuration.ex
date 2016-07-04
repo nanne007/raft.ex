@@ -1,26 +1,21 @@
-defmodule Raft.Server.Configuration do
+defmodule Raft.Supervisor.Configuration do
 
-  @typep peer :: term
 
-  defstruct [
-    id: nil,
-    term: 0,
-    index: 0,
-    members: []
-  ]
   @type t :: %__MODULE__{
-    id: term,
-    term: non_neg_integer,
-    index: non_neg_integer,
+    me: Raft.Supervisor.id,
     members: list(term)
   }
+  defstruct [
+    me: nil,
+    members: []
+  ]
 
   use GenServer
 
-  def start_link(me) do
+  def start_link(me, peers) do
     # TODO: should read configuration from file
     # For now, just in memory.
-    GenServer.start_link(__MODULE__, {me})
+    GenServer.start_link(__MODULE__, {me, peers})
   end
 
   def get_peers(pid) do
@@ -33,33 +28,27 @@ defmodule Raft.Server.Configuration do
 
   ### GenServer callbacks
 
-  def init({me}) do
+  def init({me, peers}) do
     state = %__MODULE__{
-      id: me,
-      term: 0,
-      index: 0,
-      members: [me]
+      me: me,
+      members: peers
     }
     {:ok, state}
   end
 
   def handle_call(:get_peers, _from,
                   %__MODULE__{
-                    id: id,
                     members: members
                   }=state) do
-    peers = members |> List.delete(id)
-    {:reply, peers, state}
+    {:reply, members, state}
   end
 
   def handle_call({:set_peers, new_peers}, _from,
                   %__MODULE__{
-                    id: id,
-                    members: members
                   } = state) do
     # TODO: save to disk
     state = %{
-      state | members: [id | new_peers]
+      state | members: new_peers
     }
     {:reply, :ok, state}
   end

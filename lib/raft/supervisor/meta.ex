@@ -1,8 +1,8 @@
-defmodule Raft.Server.Meta do
+defmodule Raft.Supervisor.Meta do
 
   @type t :: %__MODULE__{
-    current_term: Raft.Server.rterm,
-    voted_for: Raft.Server.id
+    current_term: Raft.Supervisor.rterm,
+    voted_for: Raft.Supervisor.id
   }
   defstruct [
     current_term: nil,

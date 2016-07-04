@@ -18,8 +18,8 @@ defmodule Raft.RPC do
     ]
 
     @type t :: %__MODULE__{
-      source: Raft.Server.id,
-      dest: Raft.Server.id,
+      source: Raft.Supervisor.id,
+      dest: Raft.Supervisor.id,
       term: non_neg_integer,
       last_log_index: non_neg_integer,
       last_log_term: non_neg_integer
@@ -34,9 +34,9 @@ defmodule Raft.RPC do
       :vote_granted
     ]
     @type t :: %__MODULE__{
-      source: Raft.Server.id,
-      dest: Raft.Server.id,
-      term: Raft.Server.rterm,
+      source: Raft.Supervisor.id,
+      dest: Raft.Supervisor.id,
+      term: Raft.Supervisor.rterm,
       vote_granted: boolean
     }
   end
@@ -54,15 +54,15 @@ defmodule Raft.RPC do
     ]
 
     @type t :: %__MODULE__{
-      term: Raft.Server.rterm,
-      source: Raft.Server.id,
-      dest: Raft.Server.id,
+      term: Raft.Supervisor.rterm,
+      source: Raft.Supervisor.id,
+      dest: Raft.Supervisor.id,
 
-      prev_log_index: Raft.Server.index,
-      prev_log_term: Raft.Server.rterm,
+      prev_log_index: Raft.Supervisor.index,
+      prev_log_term: Raft.Supervisor.rterm,
 
       entries: list(term),
-      leader_commit: Raft.Server.index
+      leader_commit: Raft.Supervisor.index
     }
   end
 
@@ -76,12 +76,12 @@ defmodule Raft.RPC do
     ]
 
     @type t :: %__MODULE__{
-      term: Raft.Server.rterm,
-      source: Raft.Server.id,
-      dest: Raft.Server.id,
+      term: Raft.Supervisor.rterm,
+      source: Raft.Supervisor.id,
+      dest: Raft.Supervisor.id,
 
       success: boolean,
-      match_index: Raft.Server.index
+      match_index: Raft.Supervisor.index
     }
   end
 
@@ -100,6 +100,6 @@ defmodule Raft.RPC do
   end
 
   def handle_msg(name, message) do
-    name |> Raft.Server.get_consensus() |> :gen_statem.cast(message)
+    name |> Raft.Supervisor.get_consensus() |> :gen_statem.cast(message)
   end
 end
