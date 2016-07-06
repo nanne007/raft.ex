@@ -207,7 +207,7 @@ defmodule Raft.Consensus do
   end
 
   def handle_event(
-    _event_type, event_content,
+    _event_type, _event_content,
     :follower, _data
   ) do
     :keep_state_and_data
@@ -359,7 +359,7 @@ defmodule Raft.Consensus do
       term: term,
       vote_granted: granted,
       source: source,
-    } = vote_reply,
+    } = _vote_reply,
     :candidate = _state,
     %__MODULE__{
       current_term: current_term,
@@ -376,7 +376,7 @@ defmodule Raft.Consensus do
       term: term,
       vote_granted: granted,
       source: source
-    } = vote_reply,
+    } = _vote_reply,
     :candidate,
     %__MODULE__{
       current_term: current_term,
@@ -557,7 +557,6 @@ defmodule Raft.Consensus do
   def handle_event(
     :internal = _event_type, {:advance_commit_index, hint},
     :leader = _state, %__MODULE__{
-      config: config,
       log: log,
       commit_index: commit_index,
       match_indexes: match_indexes
@@ -771,14 +770,16 @@ defmodule Raft.Consensus do
 
   defp accept_append_entries(
     %__MODULE__{
-      current_term: current_term
+      current_term: current_term,
+      commit_index: commit_index
     } = data,
     %AppendEntries{
       source: source,
       dest: dest,
       prev_log_index: prev_log_index,
-      entries: entries
-    } = append_entries_req
+      entries: entries,
+      leader_commit: leader_commit
+    }
   ) when length(entries) == 0 do
     reply = %AppendEntriesReply{
       term: current_term,
@@ -790,8 +791,14 @@ defmodule Raft.Consensus do
     }
     reply.dest |> Raft.RPC.send_msg(reply)
 
-    # TODO: recheck the meaning of commit_index and when to change it and how?
-    %{data | commit_index: append_entries_req.leader_commit}
+    # XXX: only advance commit index when I got equal log with leader.
+    commit_index = cond do
+      leader_commit > commit_index ->
+        min(leader_commit, prev_log_index + length(entries))
+      :else ->
+        commit_index
+    end
+    %{data | commit_index: commit_index}
   end
   defp accept_append_entries(
     %__MODULE__{
@@ -803,7 +810,7 @@ defmodule Raft.Consensus do
       dest: dest,
       prev_log_index: prev_log_index,
       entries: entries
-    } = append_entries_req
+    }
   ) when length(entries) > 0 do
     last_log_index = log |> Raft.Log.Memory.get_last_log_index()
     cond do
@@ -815,7 +822,6 @@ defmodule Raft.Consensus do
         if entry.term != List.first(entries).term do
           # conflict: remove 1 entry to do backoff
           log |> Raft.Log.Memory.truncate(1)
-          data
         else
           # already done with the request
           reply = %AppendEntriesReply{
@@ -827,12 +833,11 @@ defmodule Raft.Consensus do
             match_index: prev_log_index + length(entries)
           }
           reply.dest |> Raft.RPC.send_msg(reply)
-          # TODO: also here
-          %{data | commit_index: append_entries_req.leader_commit}
         end
+        data
       true ->
         Logger.error("this should not happen")
-        :keep_state_and_data
+        data
     end
   end
 
@@ -862,7 +867,6 @@ defmodule Raft.Consensus do
 
       # XXX: the sub_log should be inclusive.
       entries = Raft.Log.Memory.sub_log(log, next_index, entries_size)
-      last_entry_index = next_index + entries_size - 1
 
       append_entries_req = %AppendEntries{
         term: current_term,
@@ -872,7 +876,7 @@ defmodule Raft.Consensus do
         prev_log_index: relative_prev_log_index,
         prev_log_term: relative_prev_log_term,
         entries: entries,
-        leader_commit: min(commit_index, last_entry_index) # TODO: why this comparision?
+        leader_commit: commit_index
       }
       append_entries_req.dest |> Raft.RPC.send_msg(append_entries_req)
     end
