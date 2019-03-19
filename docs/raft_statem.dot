@@ -1,0 +1,31 @@
+digraph Raft {
+    rankdir=LR;
+    // size="8,5";
+    node [shape=point] initial_state;
+    node [shape=circle] Follower;
+    node [shape=circle] PreCandidate;
+    node [shape=circle] Candidate;
+    node [shape=circle] Leader;
+    node [shape=point] tick;
+    node [shape=point] raft_message_in;
+    node [shape=point] raft_message_out;
+
+
+    initial_state -> Follower [label="{:internal, :become_follower}", style="dotted"];
+
+    tick -> Follower [label="{:cast, :tick}"];
+    Follower -> PreCandidate [label = "{:internal, :election_timeout}", style="dotted"];
+    PreCandidate -> raft_message_out [label="{:cast, {:raft, :request_pre_vote}}", style="dotted"];
+
+    raft_message_in -> Follower [label="{:cast, {:raft, :request_pre_vote}}"];
+    Follower -> raft_message_out [label="{:cast, {:raft, :request_pre_vote_resp}", style="dotted"];
+
+
+    raft_message_in -> PreCandidate [label="{:cast, {:raft, :request_pre_vote_resp}"];
+    PreCandidate -> Candidate [label = "vote_grants"];
+
+    Candidate -> Leader;
+
+    raft_message_in -> Candidate [label="{:cast, {:raft, :request_vote_resp}}"];
+
+}
