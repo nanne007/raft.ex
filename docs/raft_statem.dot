@@ -1,0 +1,17 @@
+digraph Raft {
+    rankdir=LR;
+    size="8,5";
+    node [shape=point] qi;
+    node [shape=circle] Follower;
+    node [shape=circle] PreCandidate;
+    node [shape=circle] Candidate;
+    node [shape=circle] Leader;
+    qi -> Follower [label="{:internal, :become_follower}"];
+
+Follower -> PreCandidate [label = "election_timeout"];
+
+PreCandidate -> Candidate [label = "vote_grants"];
+
+Candidate -> Leader;
+
+}
